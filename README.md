@@ -28,7 +28,6 @@ Examples:
     print(ids, tokens)
 
 Todo:
-
-    - Evaluate different splitting algorithms (Tolerance Principle / Sufficiency Principle in the root-trie only)
-    - Multi word evaluation before splitting
-    - Type-based approach, intead of token-based approach
+- Evaluate different splitting algorithms (Tolerance Principle / Sufficiency Principle in the root-trie only)
+- Multi word evaluation before splitting
+- Type-based approach, intead of token-based approach
