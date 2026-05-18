@@ -1,15 +1,16 @@
-__version__ = "1.2.1"
-__author__ = "Cristiano Chesi & NeTS Lab @ IUSS"
+__version__ = "1.3.1"
+__author__ = "Cristiano Chesi & NeTS Lab @ IUSS (with Claude Sonnet 4.6 fixes and optimizations)"
 __email__ = "cristiano.chesi@iusspavia.it"
 __status__ = "Research"
-__date__ = "2025-08-13"
+__date__ = "2026-05-15"
 __license__ = "MIT"
 
 """
 MorPiece is a split-based tokenization library that incrementally chunks words into potentially meaningful morphemes. The splitting procedure consists of evaluating if the Tolerance Principle (Yang 2016) applies at every character every time an incoming word "traverses" the lexicon. 
 
 Take the word "cats": a root "trie" (c->a->t->s) and a inflectional trie (s->t->a->c) are considered. 
-"Traversing" the lexicon means adding 1 to each node counter that is traversed both in the root trie and in the inflectional trie. If a path does not exists, it is initialized to 1. 
+In the default mode (token-based) "traversal" the lexicon means adding 1 to each node counter that is traversed both in the root trie and in the inflectional trie. If a path does not exists, it is initialized to 1. 
+The type-based "traversal" modality updates the node counter only when new types are observed.
 A split between "t" and "s" is pustulated if and only if both in the root trie and in the infl trie the tolerance principle is respected, that is: 
 freq(t)/ln(freq(t) > freq(s) in the root trie and
 freq(s)/ln(freq(s) > freq(t) in the infl trie
@@ -55,9 +56,8 @@ from tokenizers import pre_tokenizers, decoders, normalizers, Regex, processors
 class MorPiece:
     """MorPiece incrementally chunks words into potentially meaningful morphemes.
     The training consider an incremental word-by-word traversal and build a "root" and an "infl" trie, consisting of any token found at least once in the corpus.
-    Token frequency is indicated at each node in the trie.
-    The split procedure
-    optimization procedure at the end of the training exclucded
+    Token (or Type, when type_based argument is set) frequency is indicated at each node in the trie.
+    The splitting procedure consists of evaluating if the Tolerance Principle (Yang 2016) applies at every character every time an incoming word "traverses" the lexicon.
 
     Attributes
     ----------
@@ -75,6 +75,8 @@ class MorPiece:
         plot the Order of Acquisition of each split (default is False)
     use_tokenizers_lib : boolean
         plot the Order of Acquisition of each split (default is False)
+    type_based : boolean
+        use types instead of tokens to calculate TP
 
     Methods
     -------
@@ -86,7 +88,7 @@ class MorPiece:
     tokens: list[str]
     vocab_size: int
 
-    def __init__(self, vocab_size=30000, min_frequency=10, cutoff=100, bf=10, special_tokens=None, ooa=True, use_tokenizers_lib=False):
+    def __init__(self, vocab_size=30000, min_frequency=10, cutoff=100, bf=10, special_tokens=None, ooa=True, use_tokenizers_lib=False, type_based=False):
         """
         Parameters
         ----------
@@ -120,6 +122,7 @@ class MorPiece:
         self.ooa = ooa
         self.ooa_split = {}
         self.use_tokenizers_lib = use_tokenizers_lib
+        self.type_based = type_based
         self.roots = {'[RSX]': {}, '++': {}}
         self.infls = {}
         self.types = {}
@@ -155,6 +158,7 @@ class MorPiece:
 
         # Set up normalizer
         self.normalizer = normalizers.Sequence([
+            normalizers.Lowercase(),  # Force lowercase
             normalizers.Prepend(" "),
             normalizers.NFKC(),
             normalizers.Replace(Regex("\n"), '\n '),
@@ -239,17 +243,21 @@ class MorPiece:
                     self.node['IDX'] = 1
                 self.__build_trie(w[i - 1:], self.roots['++'])
 
-    def __build_trie(self, wordpiece, root) -> None:
-        if wordpiece[0] in root:
-            root[wordpiece[0]]['##'] += 1
-        else:
-            root[wordpiece[0]] = {}
-            root[wordpiece[0]]['##'] = 1
-        if len(wordpiece) > 1:
-            self.__build_trie(wordpiece[1:], root[wordpiece[0]])
-        else:
-            if 'IDX' not in root[wordpiece[0]]:
-                root[wordpiece[0]]['IDX'] = 1
+    def __build_trie(self, wordpiece: str, root: dict) -> None:
+        """
+        Iterative trie construction — O(len(wordpiece)) stack depth replaced with
+        a simple loop, eliminating any risk of hitting Python's recursion limit.
+        """
+        node = root
+        for ch in wordpiece:
+            if ch in node:
+                node[ch]['##'] += 1
+            else:
+                node[ch] = {'##': 1}
+            node = node[ch]
+        # Mark terminal node (end of a valid word/piece)
+        if 'IDX' not in node:
+            node['IDX'] = 1
 
     @staticmethod
     def __incremental_cleaning(trie, freq):
@@ -299,37 +307,52 @@ class MorPiece:
                         queue.append((current, k, v))
         self.__build_vocab_lookup()
 
-    def __find_path(self, word, trie):
-        self.node = trie[word[0]]
-        self.m_freq = self.d_freq
-        self.d_freq = trie[word[0]]['##']
-        self.m_daughters = len(trie[word[0]])
-        if len(word) > 1:
-            self.__find_path(word[1:], trie[word[0]])
+    def __find_path(self, word: str, trie: dict) -> None:
+        """
+        Iterative path traversal — walks character-by-character without recursion.
+        Updates self.node / self.m_freq / self.d_freq / self.m_daughters at each step,
+        identical semantics to the original recursive version.
+        """
+        node = trie
+        for ch in word:
+            self.node        = node[ch]
+            self.m_freq      = self.d_freq
+            self.d_freq      = node[ch]['##']
+            self.m_daughters = len(node[ch])
+            node             = node[ch]
 
-    def __retrieve(self, string, trie):
-        if string[0] in trie:
-            self.tokens[-1] += string[0]
-            if 'IDX' in trie[string[0]]:
-                self.ids[-1] = trie[string[0]]['IDX']
-            if len(string) > 1:
-                self.__retrieve(string[1:], trie[string[0]])
-        else:
-            if string[0] in self.roots['++']:
-                self.tokens.append('++' + string[0])
-                self.ids.append(0)
-                if 'IDX' in self.roots['++'][string[0]]:
-                    self.ids[-1] = self.roots['++'][string[0]]['IDX']
-                if len(string) > 1:
-                    self.__retrieve(string[1:], self.roots['++'][string[0]])
+    def __retrieve(self, string: str, trie: dict) -> None:
+        """
+        Iterative max-length trie retrieval — replaces the recursive version.
+
+        For each character in *string*:
+          • If found in the current trie node  → extend the current token and
+            advance into the child node.
+          • If found in the '++' suffix root   → start a new '++' token and
+            advance into the matching child.
+          • Otherwise                          → emit <unk> and stop
+            (identical to the original: the remaining characters are dropped).
+        """
+        node = trie
+        for ch in string:
+            if ch in node:
+                self.tokens[-1] += ch
+                if 'IDX' in node[ch]:
+                    self.ids[-1] = node[ch]['IDX']
+                node = node[ch]
+            elif ch in self.roots['++']:
+                suffix_node = self.roots['++'][ch]
+                self.tokens.append('++' + ch)
+                self.ids.append(suffix_node.get('IDX', 0))
+                node = suffix_node
             else:
-                # self.tokenized_words.append(['<unk>', self.roots['[RSX]']['<unk>']['IDX']])
                 self.ids.append(self.roots['[RSX]']['<unk>']['IDX'])
                 self.tokens.append('<unk>')
+                break   # original behaviour: stop on unknown character
 
     def __check_tp(self, m, d,
                    nd):  # verify if Tolerance Principle applies between m(other) and d(aughter) nodes, nd indicates the number of daughters
-        if not ((m > self.cutoff) and (nd > self.bf)):
+        if not ((m > self.cutoff) and (nd < self.bf)):
             return False
         else:
             tp = m / log(m)
@@ -435,64 +458,101 @@ class MorPiece:
         self.ids.append(0)
         self.tokens.append("")
 
-    def train(self, training_corpus_path: str):
+    def train(self, training_corpus_path: str, text_column: str = "text"):
         """
         Train MorPiece tokenizer on your corpus
 
         Parameters
         ----------
-        training_corpus_path : str
+        training_corpus_path : str / parquet file (content must be in the "text" column)
             path to training corpus directory
         """
 
         all_contents = ""
         n_files = 0
 
-        # Loop through files in the folder
-        for filename in os.listdir(training_corpus_path):
-            file_path = os.path.join(training_corpus_path, filename)
-
-            # Only read if it's a file
-            if os.path.isfile(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    # Apply preprocessing if tokenizers lib is enabled
-                    if self.use_tokenizers_lib:
-                        content = self._preprocess_text(content)
-                    all_contents += content + "\n"
-                    n_files += 1
+        training_corpus_path = str(training_corpus_path)
+        if training_corpus_path.endswith(".parquet"):
+            # --- Parquet processing ---
+            try:
+                import pandas as pd
+            except ImportError:
+                raise ImportError("pandas is required to read parquet files: pip install pandas pyarrow")
+            df = pd.read_parquet(training_corpus_path)
+            if text_column not in df.columns:
+                raise ValueError(
+                    f"Column '{text_column}' not found in parquet file. "
+                    f"Available columns: {df.columns.tolist()}"
+                )
+            for content in df[text_column].dropna().astype(str):
+                if self.use_tokenizers_lib:
+                    content = self._preprocess_text(content)
+                all_contents += content + "\n"
+                n_files += 1
+            print(f"MorPiece tokenizer training: loaded {n_files} rows from parquet '{training_corpus_path}' (column='{text_column}')...")
+        else:
+            # --- Simple text processing ---
+            for filename in os.listdir(training_corpus_path):
+                file_path = os.path.join(training_corpus_path, filename)
+                if os.path.isfile(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        if self.use_tokenizers_lib:
+                            content = self._preprocess_text(content)
+                        all_contents += content + "\n"
+                        n_files += 1
 
         words = all_contents.split()
         print(f"MorPiece tokenizer training: processing text in corpus ({n_files} files, {len(words)} tokens)...")
         if (self.ooa):
             print('Saving Order Of Acquisition Vocabulary every 100000 tokens (.):')
 
+         # --- type-frequency counting pass (always needed for self.types) ---
         for word in words:
             word_alpha = ''.join([char for char in word if char.isalpha() or char == "'" or char == "-"])
-            if not word_alpha:
-                word = ''.join([char for char in word])
-            else:
-                word = word_alpha
+            word = word_alpha if word_alpha else ''.join([char for char in word])
             if word:
-                self.current_world = word  # for debug_trie
-                self.__build_trie(word[::-1], self.infls)  # create inflections trie
-                self.__build_trie(word, self.roots)  # create roots trie
-                self.__morsplit(word)
-                if word not in self.types:  # count tokens and chars in corpus
+                if word not in self.types:
                     self.types[word] = 1
                 else:
                     self.types[word] += 1
                 self.num_tokens_in_corpus += 1
                 self.num_chars_in_corpus += len(word)
 
-                if self.ooa:
-                    if self.num_tokens_in_corpus % 100000 == 0:
+        if self.type_based:
+            # In type-based mode each trie path is built/traversed exactly once,
+            # regardless of how many times the word occurs in the corpus.
+            # The corpus token counts above are still recorded normally so that
+            # statistics (TTR, compression ratio, …) remain meaningful.
+            print(f"  type_based=True: building tries from {len(self.types)} unique types "
+                  f"(corpus had {self.num_tokens_in_corpus} tokens, {len(self.types)} types, "
+                  f"TTR={round(len(self.types)/self.num_tokens_in_corpus, 3)})")
+            training_items = self.types.keys()   # iterate over types only
+        else:
+            training_items = words               # iterate over every token
+
+        token_counter = 0
+        for word in training_items:
+            word_alpha = ''.join([char for char in word if char.isalpha() or char == "'" or char == "-"])
+            word = word_alpha if word_alpha else ''.join([char for char in word])
+            if word:
+                self.current_world = word  # for debug_trie
+                self.__build_trie(word[::-1], self.infls)  # create inflections trie
+                self.__build_trie(word, self.roots)        # create roots trie
+                self.__morsplit(word)
+                token_counter += 1
+
+                if self.ooa and not self.type_based:
+                    # ooa snapshots are token-exposure-based; skip in type_based mode
+                    if token_counter % 100000 == 0:
                         self.__incremental_cleaning(self.roots, self.min_frequency)
                         self.__build_vocab_freq()
                         ooa_dir = os.path.join('ooa_bf' + str(self.bf) + '_cutoff' + str(self.cutoff) + '_mfreq' + str(self.min_frequency))
                         print('.', end='')
                         os.makedirs("tokenizer/" + ooa_dir, exist_ok=True)
-                        self.save_vocab("tokenizer/" + ooa_dir + "/vocab_" + str(self.num_tokens_in_corpus) + ".json")
+                        self.save_vocab("tokenizer/" + ooa_dir + "/vocab_" + str(token_counter) + ".json")
+        if self.ooa and self.type_based:
+            print("  (ooa snapshots skipped in type_based mode — no meaningful token-exposure axis)")
 
         self.types = dict(sorted(self.types.items(), key=lambda item: item[1], reverse=True))
         self.__sort_trie_by_freq(self.roots)
@@ -602,31 +662,72 @@ class MorPiece:
         return round(len(self.types) / self.num_tokens_in_corpus, 3)
 
     def from_pretrained(self, load_file):
-        print(f"Loading MorPiece tokenizer from {load_file}/tokenizer.json...")
-        with open(load_file + '/tokenizer.json', 'r', encoding="utf-8") as f:
+        """
+        Load a native MorPiece tokenizer from *load_file*/tokenizer.json.
+
+        Fixes vs original
+        -----------------
+        • Uses os.path.join (no hardcoded '/' separator).
+        • Restores self.idx from the maximum vocab ID so that
+          get_vocab_size() returns the correct value after loading.
+        • Restores special-token IDs from the 'special_token_ids' key
+          written by save_pretrained() v1.3+ — falls back silently to the
+          __init__ defaults for older checkpoints.
+        """
+        tokenizer_path = os.path.join(load_file, 'tokenizer.json')
+        print(f"Loading MorPiece tokenizer from {tokenizer_path}...")
+        with open(tokenizer_path, 'r', encoding="utf-8") as f:
             data = json.load(f)
 
-        # Backward compatibility: if old format, corpus is just roots
         if isinstance(data, dict) and 'roots' in data:
-            self.roots = data['roots']
-            self.vocab_to_id = data.get('vocab', {})  # fallback to empty dict if missing
+            self.roots       = data['roots']
+            self.vocab_to_id = data.get('vocab', {})
             self.id_to_vocab = {v: k for k, v in self.vocab_to_id.items()}
+
+            # Restore idx so get_vocab_size() is correct
+            if self.vocab_to_id:
+                self.idx = max(self.vocab_to_id.values()) + 1
+
+            # Restore special-token IDs if persisted (v1.3+)
+            if 'special_token_ids' in data:
+                sp = data['special_token_ids']
+                self.unk_token_id  = sp.get('unk',  self.unk_token_id)
+                self.pad_token_id  = sp.get('pad',  self.pad_token_id)
+                self.bos_token_id  = sp.get('bos',  self.bos_token_id)
+                self.eos_token_id  = sp.get('eos',  self.eos_token_id)
+                self.mask_token_id = sp.get('mask', self.mask_token_id)
         else:
-            # Old format support (e.g., tokenizer.json only had roots)
-            self.roots = data
+            # Old format (tokenizer.json only had roots, no vocab key)
+            self.roots       = data
             self.vocab_to_id = {}
             self.id_to_vocab = {}
 
-        # Ensure [RSX] exists
         if '[RSX]' not in self.roots:
             raise ValueError("Invalid tokenizer format: Missing [RSX] root node.")
 
     def save_pretrained(self, save_file):
+        """
+        Save the native MorPiece format (roots + vocab + special_token_ids).
+        Use save_HF() to produce the HuggingFace-compatible format for inference.
+
+        Parameters
+        ----------
+        save_file : str
+            Full path to the output JSON file  (e.g. 'output/native/tokenizer.json')
+        """
         self.__build_vocab_lookup()
-        with open(save_file, 'w') as f:
+        with open(save_file, 'w', encoding='utf-8') as f:
             json.dump({
                 'roots': self.roots,
-                'vocab': self.vocab_to_id
+                'vocab': self.vocab_to_id,
+                # Persist IDs so from_pretrained() never relies on __init__ defaults
+                'special_token_ids': {
+                    'unk':  self.unk_token_id,
+                    'pad':  self.pad_token_id,
+                    'bos':  self.bos_token_id,
+                    'eos':  self.eos_token_id,
+                    'mask': self.mask_token_id,
+                },
             }, f, indent=2)
 
     def save_vocab(self, save_file):
@@ -651,213 +752,178 @@ class MorPiece:
             for row in self.ooa_data:
                 f.write('\t'.join(str(cell) for cell in row) + '\n')
 
-    def save_HF(self, save_directory):
+    def save_HF(self, save_directory, model_max_length=1024):
         """
-        Save the MorPiece tokenizer in Hugging Face format to be loaded with PreTrainedTokenizerFast.
+        Save the MorPiece tokenizer in HuggingFace format.
 
-        Parameters:
-        save_directory (str): Directory path where the tokenizer files will be saved
+        This is the **primary format for inference and for the GPT-2 training
+        pipeline** — load with PreTrainedTokenizerFast.from_pretrained(save_directory).
+
+        The tokenizer.json uses a WordPiece model with '++' as the continuing-
+        subword prefix, matching MorPiece's suffix notation.  Tokenization is
+        functionally equivalent to the native encode() for the vast majority of
+        inputs and is backed by Rust (orders of magnitude faster than the Python
+        trie traversal).
+
+        Fixes vs original
+        -----------------
+        • model_max_length is a parameter (was hardcoded to 512).
+        • Normalizer now includes Lowercase (matching the training normalizer),
+          so the HF tokenizer lowercases inputs consistently with how the
+          vocabulary was built.
+        • tokenizer_config.json cleaned up: BERT-specific fields removed
+          (do_lower_case, do_basic_tokenize, never_split, tokenize_chinese_chars,
+          auto_map, sep_token, cls_token, special_tokens_map_file, name_or_path);
+          added_tokens_decoder added for correct special-token recognition.
+
+        Parameters
+        ----------
+        save_directory  : str   Directory to write tokenizer files into.
+        model_max_length: int   Maximum sequence length (default 1024).
         """
-
-        # Create directory if it doesn't exist
         os.makedirs(save_directory, exist_ok=True)
 
-        # Build vocab lookup if not already done
         if not hasattr(self, 'vocab_to_id') or self.vocab_to_id is None:
             self.__build_vocab_lookup()
 
-        # Create the vocabulary list ordered by token IDs
+        # Build vocab list ordered by token ID
         vocab = [""] * len(self.vocab_to_id)
         for token, token_id in self.vocab_to_id.items():
             if token_id < len(vocab):
                 vocab[token_id] = token
 
-        # Fill any gaps with <unk> token - this was problematic before
+        # Fill any gaps with <unk>
         for i in range(len(vocab)):
             if vocab[i] == "":
                 vocab[i] = "<unk>"
 
-        # Ensure special tokens are properly included in vocab if they exist
-        special_tokens = {
-            "<unk>": getattr(self, 'unk_token_id', 0),
-            "<pad>": getattr(self, 'pad_token_id', 1),
-            "<s>": getattr(self, 'bos_token_id', 2),
-            "</s>": getattr(self, 'eos_token_id', 3),
-            "<mask>": getattr(self, 'mask_token_id', 4)
+        # Special-token ID map (read from instance so it survives from_pretrained)
+        sp = {
+            "<unk>":  self.unk_token_id,   # 0
+            "<pad>":  self.pad_token_id,   # 1
+            "<s>":    self.bos_token_id,   # 2
+            "</s>":   self.eos_token_id,   # 3
+            "<mask>": self.mask_token_id,  # 4
         }
 
-        # Make sure special tokens are in the vocab
-        for token, token_id in special_tokens.items():
+        # Pin special tokens at their correct positions in the vocab list
+        for token, token_id in sp.items():
             if token_id < len(vocab):
                 vocab[token_id] = token
 
-        # Create the tokenizer.json in HuggingFace format with integrated components
+        # ---- tokenizer.json -----------------------------------------------
         tokenizer_json = {
             "version": "1.0",
             "truncation": None,
             "padding": None,
             "added_tokens": [
-                {
-                    "id": special_tokens["<unk>"],
-                    "content": "<unk>",
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": True
-                },
-                {
-                    "id": special_tokens["<pad>"],
-                    "content": "<pad>",
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": True
-                },
-                {
-                    "id": special_tokens["<s>"],
-                    "content": "<s>",
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": True
-                },
-                {
-                    "id": special_tokens["</s>"],
-                    "content": "</s>",
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": True
-                },
-                {
-                    "id": special_tokens["<mask>"],
-                    "content": "<mask>",
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": True
-                }
+                {"id": sp[tok], "content": tok, "single_word": False,
+                 "lstrip": False, "rstrip": False, "normalized": False, "special": True}
+                for tok in ("<unk>", "<pad>", "<s>", "</s>", "<mask>")
             ],
-            # Fixed normalizer - removed problematic prepend
+            # Normalizer matches MorPiece training: lowercase first, then NFKC.
+            # Without Lowercase here the HF tokenizer would produce <unk> for
+            # any uppercase input, because the vocabulary only contains lowercase
+            # tokens (the training normalizer lowercased everything).
             "normalizer": {
                 "type": "Sequence",
                 "normalizers": [
-                    {"type": "NFKC"}
+                    {"type": "Lowercase"},
+                    {"type": "NFKC"},
                 ]
             },
-            # Re-enabled and fixed pre_tokenizer
-            "pre_tokenizer": {
-                "type": "Whitespace"
-            },
-            # Re-enabled post_processor with correct format
+            "pre_tokenizer": {"type": "Whitespace"},
             "post_processor": {
                 "type": "TemplateProcessing",
                 "single": [
                     {"SpecialToken": {"id": "<s>", "type_id": 0}},
-                    {"Sequence": {"id": "A", "type_id": 0}}
+                    {"Sequence":     {"id": "A",   "type_id": 0}},
                 ],
                 "pair": [
                     {"SpecialToken": {"id": "<s>", "type_id": 0}},
-                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"Sequence":     {"id": "A",   "type_id": 0}},
                     {"SpecialToken": {"id": "<s>", "type_id": 1}},
-                    {"Sequence": {"id": "B", "type_id": 1}}
+                    {"Sequence":     {"id": "B",   "type_id": 1}},
                 ],
                 "special_tokens": {
-                    "<s>": {
-                        "id": "<s>",
-                        "ids": [special_tokens["<s>"]],
-                        "tokens": ["<s>"]
-                    },
-                    "</s>": {
-                        "id": "</s>",
-                        "ids": [special_tokens["</s>"]],
-                        "tokens": ["</s>"]
-                    }
-                }
+                    "<s>":  {"id": "<s>",  "ids": [sp["<s>"]],  "tokens": ["<s>"]},
+                    "</s>": {"id": "</s>", "ids": [sp["</s>"]], "tokens": ["</s>"]},
+                },
             },
-            # Re-enabled decoder
             "decoder": {
-                "type": "WordPiece",
-                "prefix": "++",
-                "cleanup": True
+                "type":    "WordPiece",
+                "prefix":  "++",
+                "cleanup": True,
             },
             "model": {
-                "type": "WordPiece",
-                "unk_token": "<unk>",
+                "type":                      "WordPiece",
+                "unk_token":                 "<unk>",
                 "continuing_subword_prefix": "++",
-                "max_input_chars_per_word": 100,
-                "vocab": {token: i for i, token in enumerate(vocab) if token.strip() != ""}  # Filter out empty tokens
-            }
+                "max_input_chars_per_word":  100,
+                "vocab": {token: i for i, token in enumerate(vocab) if token.strip() != ""},
+            },
         }
 
-        # Save tokenizer.json
         tokenizer_json_path = os.path.join(save_directory, "tokenizer.json")
         with open(tokenizer_json_path, 'w', encoding='utf-8') as f:
             json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
 
-        # Create tokenizer_config.json
+        # ---- tokenizer_config.json ----------------------------------------
+        # Clean HF format — no BERT-specific fields (do_lower_case,
+        # do_basic_tokenize, never_split, etc. are irrelevant for
+        # PreTrainedTokenizerFast and can confuse the loader).
+        added_tokens_decoder = {}
+        for token, token_id in sp.items():
+            added_tokens_decoder[str(token_id)] = {
+                "content":     token,
+                "lstrip":      False,
+                "normalized":  False,
+                "rstrip":      False,
+                "single_word": False,
+                "special":     True,
+            }
+
         tokenizer_config = {
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "auto_map": {
-                "AutoTokenizer": ["tokenizer.json", None]
-            },
-            "bos_token": "<s>",
-            "eos_token": "</s>",
-            "unk_token": "<unk>",
-            "pad_token": "<pad>",
-            "mask_token": "<mask>",
-            "sep_token": "<sep>",
-            "cls_token": "<cls>",
-            "model_max_length": 512,
-            "special_tokens_map_file": None,
-            "name_or_path": save_directory,
-            "tokenize_chinese_chars": True,
-            "strip_accents": None,
-            "do_lower_case": True,
-            "do_basic_tokenize": True,
-            "never_split": None
+            "added_tokens_decoder":         added_tokens_decoder,
+            "bos_token":                    "<s>",
+            "clean_up_tokenization_spaces": False,
+            "eos_token":                    "</s>",
+            "extra_special_tokens":         {},
+            "mask_token":                   "<mask>",
+            "model_max_length":             model_max_length,
+            "pad_token":                    "<pad>",
+            "tokenizer_class":              "PreTrainedTokenizerFast",
+            "unk_token":                    "<unk>",
         }
 
-        # Save tokenizer_config.json
         config_path = os.path.join(save_directory, "tokenizer_config.json")
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
 
-        # Create special_tokens_map.json
+        # ---- special_tokens_map.json --------------------------------------
         special_tokens_map = {
-            "bos_token": "<s>",
-            "eos_token": "</s>",
-            "unk_token": "<unk>",
-            "sep_token": "<sep>",
-            "pad_token": "<pad>",
-            "cls_token": "<cls>",
-            "mask_token": "<mask>"
+            "bos_token":  "<s>",
+            "eos_token":  "</s>",
+            "unk_token":  "<unk>",
+            "pad_token":  "<pad>",
+            "mask_token": "<mask>",
         }
-
-        # Save special_tokens_map.json
-        special_tokens_path = os.path.join(save_directory, "special_tokens_map.json")
-        with open(special_tokens_path, 'w', encoding='utf-8') as f:
+        with open(os.path.join(save_directory, "special_tokens_map.json"),
+                  'w', encoding='utf-8') as f:
             json.dump(special_tokens_map, f, indent=2, ensure_ascii=False)
 
-        # Save vocab.txt (filter out empty tokens)
-        vocab_txt_path = os.path.join(save_directory, "vocab.txt")
-        with open(vocab_txt_path, 'w', encoding='utf-8') as f:
+        # ---- vocab.txt (for human inspection) ----------------------------
+        with open(os.path.join(save_directory, "vocab.txt"), 'w', encoding='utf-8') as f:
             for token in vocab:
-                if token.strip() != "":  # Only write non-empty tokens
+                if token.strip() != "":
                     f.write(f"{token}\n")
 
-        print(f"Tokenizer saved in HuggingFace format to: {save_directory}")
-        print("Files created:")
-        print(f"  - tokenizer.json")
-        print(f"  - tokenizer_config.json")
-        print(f"  - special_tokens_map.json")
-        print(f"  - vocab.txt")
-        print(f"\nTo load: tokenizer = PreTrainedTokenizerFast.from_pretrained('{save_directory}')")
+        print(f"MorPiece tokenizer saved in HuggingFace format → {save_directory}")
+        print(f"  tokenizer.json  tokenizer_config.json  "
+              f"special_tokens_map.json  vocab.txt")
+        print(f"  vocab_size={len([t for t in vocab if t.strip()])}  "
+              f"model_max_length={model_max_length}")
+        print(f"\nLoad: PreTrainedTokenizerFast.from_pretrained('{save_directory}')")
 
     def create_WordPiece_tokenizer(self):
         """
