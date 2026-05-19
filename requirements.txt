@@ -1,0 +1,6 @@
+# Core dependency
+tokenizers>=0.13.0
+
+# Optional utilities commonly needed
+numpy>=1.21
+tqdm>=4.64
