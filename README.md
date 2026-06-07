@@ -146,10 +146,10 @@ Worked example — "asociale" vs "asola" (both depth-1 split candidates):
 Unversioned maintenance changes
 -------------------------------
 • FIX – _preprocess_text destroyed special tokens appearing literally in the
-  input.  When use_tokenizers_lib was on, a token such as "<pad>", "<mask>",
-  "<s>", or "<speaker_A>" was fed through the normaliser, whose TIER 1
-  punctuation rules isolate "<" and ">" ( "<pad>" -> "< pad >" ), after which
-  the pre-tokeniser shredded it into "<" + "pad" + ">".  The [RSX] lookup in
+  input.  When use_tokenizers_lib was on, a token such as "\<pad\>", "\<mask\>",
+  "\<s\>", or "\<speaker_A\>" was fed through the normaliser, whose TIER 1
+  punctuation rules isolate "\<" and "\>" ( "\<pad\>" -> "\< pad \>" ), after which
+  the pre-tokeniser shredded it into "\<" + "pad" + "\>".  The [RSX] lookup in
   encode() could then never match it.  "*CHI:" survived only via a long,
   fragile raw-token reconstruction loop.
 
