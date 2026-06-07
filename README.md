@@ -1,7 +1,8 @@
 MorPiece is a split-based tokenization library that incrementally chunks words into potentially meaningful morphemes. The splitting procedure consists of evaluating if the Tolerance Principle (Yang 2016) applies at every character every time an incoming word "traverses" the lexicon. 
 
 Take the word "cats": a root "trie" (c->a->t->s) and a inflectional trie (s->t->a->c) are considered. 
-"Traversing" the lexicon means adding 1 to each node counter that is traversed both in the root trie and in the inflectional trie. If a path does not exists, it is initialized to 1. 
+In the default mode (token-based) "traversal" the lexicon means adding 1 to each node counter that is traversed both in the root trie and in the inflectional trie. If a path does not exists, it is initialized to 1. 
+The type-based "traversal" modality updates the node counter only when new types are observed.
 A split between "t" and "s" is pustulated if and only if both in the root trie and in the infl trie the tolerance principle is respected, that is: 
 freq(t)/ln(freq(t) > freq(s) in the root trie and
 freq(s)/ln(freq(s) > freq(t) in the infl trie
@@ -10,15 +11,15 @@ if this is the case, the "s" pendant (in this case just "s") is added to the roo
 At the end, all nodes that does not have a frequency above min_freq parameter are pruned.
 MaxLength strategy is adopted to retrieve the tokens for each word.
 
-If the "order or acquisition" (ooa) parameter is set to True, each 100K of exposure a vocabulary is created to check splitting hypotheses postulated and the evidence needed (for research purposes)
+Since version 1.4.* a type-based tokenization option is implemented ('type_based = true')
 
-+ version 1.2.* supports HF tokenizers pre and post processing standard routines
+If the "order or acquisition" (ooa) parameter is set to True, each 100K of exposure a vocabulary is created to check splitting hypotheses postulated and the evidence needed (for research purposes)
 
 Examples:
 
     import tokenizer_MorPiece as MoP
 
-    mop = MoP.MorPiece(vocab_size=vocab_size, cutoff=cutoff, min_frequency=min_frequency, bf=bf, ooa=ooa, use_tokenizers_lib=True)
+    mop = MoP.MorPiece(vocab_size=vocab_size, cutoff=cutoff, min_suffix_stems=3, min_frequency=min_frequency, ooa=ooa, use_tokenizers_lib=True)
     mop.train(text)
     mop.save('./mop_tokenizer/tokenizer.json')
 
@@ -28,9 +29,8 @@ Examples:
     print(ids, tokens)
 
 Todo:
-- Evaluate different splitting algorithms (Tolerance Principle / Sufficiency Principle in the root-trie only)
-- Multi word evaluation before splitting
-- Type-based approach, intead of token-based approach
+
+    - Multi word evaluation before splitting
 
 
 RELEASE NOTES:
@@ -43,12 +43,10 @@ Changes in 1.4.4
     with "l"; instead it is picked up as that leading character of the NEXT
     word, yielding the token "'abbadessa" — and therefore a root-trie path
     that begins with "'".
-
-    Fix — one normaliser rule, applied before pre-tokenisation:
-
-        an apostrophe immediately followed by a letter gets a space
-        inserted after it          ( '(?=letter)  ->  "' "  )
-
+    
+•   Fix — one normaliser rule, applied before pre-tokenisation:
+    an apostrophe immediately followed by a letter gets a space
+    inserted after it          ( '(?=letter)  ->  "' "  )
     The apostrophe can then only stay with the word on its LEFT or stand
     alone; it can never open a word.  This is positional and language-
     agnostic — no word list, no Italian-specific logic:
@@ -89,16 +87,16 @@ Changes in 1.4.3
     keeps its raw '##' frequency count and its placeholder 'IDX' marker, and
     the ++ suffix→stems map is included as well.
 
-    This snapshot is exactly what the companion trie-explorer script
+This snapshot is exactly what the companion trie-explorer script
     (morpiece_trie_explorer.py) consumes to visualise which branches the
     min_frequency cut will later discard, with the original frequencies
     shown on each node.
-
-    Pass a path string, or `True` for the default
+    
+Pass a path string, or `True` for the default
     'tokenizer/complete_tries.json'.  The default is None (disabled): when
     the option is not used, training behaviour is byte-for-byte unchanged.
 
-    NOTE: in token-based mode (type_based=False) with ooa=True the trie is
+NOTE: in token-based mode (type_based=False) with ooa=True the trie is
     already thinned every 100 000 tokens by __incremental_cleaning, so
     'complete' there means 'complete as of end-of-training', not 'every node
     ever created'.
@@ -114,20 +112,20 @@ Changes in 1.4.2
     (Italian verb stems like `cant-` have 15–20+ productive continuations,
     which is the morphological *signal*, not noise).
 
-    The productivity criterion is now purely `d > m / log(m)` (with
+The productivity criterion is now purely `d > m / log(m)` (with
     `m > cutoff` as a precondition).  This matches Yang's original TP
     formulation more directly: productivity is determined by whether the
     daughter count clears the tolerance threshold relative to the mother
     population, regardless of how many siblings the daughter has.
 
-    Guards against over-splitting at short prefixes (e.g. depth-1 nodes
+Guards against over-splitting at short prefixes (e.g. depth-1 nodes
     where every letter branches widely):
       1. The `cutoff` precondition: tiny daughter populations are rejected.
       2. The bilateral root×infl check: BOTH sides must clear TP.
       3. `min_suffix_stems`: spurious ++ suffixes deriving from too few
          distinct stems are pruned post-hoc.
 
-    Worked example — "asociale" vs "asola" (both depth-1 split candidates):
+Worked example — "asociale" vs "asola" (both depth-1 split candidates):
       • asociale: root TP at `a|s` usually fails because `as*` is a small
         fraction of all `a*`-initial tokens (d/m below 1/log(m)).  Even if
         the algorithm never explicitly produces `a-sociale`, at retrieval
