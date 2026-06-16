@@ -98,6 +98,8 @@ def main():
                         help='Path to the folder for saving the trained tokenizer')
     parser.add_argument('--min_frequency', type=int, required=False, default=10,
                         help='Min frequency to include a token in the final vocabulary')
+    parser.add_argument('--min_suffix_stems', type=int, required=False, default=3,
+                        help='Min distinct root stems a ++ suffix must derive from (default 3)')
     parser.add_argument('--cutoff', type=int, required=False, default=100,
                         help='Cutoff parameter expressing the lower frequency threshold (for mother node) to apply the Tolerance Principle')
     parser.add_argument('--bf', type=int, required=False, default=10,
@@ -107,8 +109,15 @@ def main():
                         help='If True, the Order of Acquisition of various splits is generated (this requires extra computation)')
     parser.add_argument('--type_based', action='store_true',
                         help='If True, the Order of Acquisition of various splits is generated (this requires extra computation)')
+    parser.add_argument('--use_tokenizers_lib', action='store_true',
+                        help='Use default tokenizer libraries to clean the text')
     parser.add_argument('--text_column', type=str, required=False, default='text',
                         help='Column name for text content when training_dir is a .parquet file (default: text)')
+    parser.add_argument('--boundaries_discovery', action='store_true',
+                        help='Whitespace-free, utterance-anchored boundary discovery: true '
+                             'starts/ends from punctuation+line breaks, sequences sorted '
+                             'shorter-first, spaces demoted to a soft cue. Lets MoP run '
+                             'uniformly on eng/nld AND zho without a word segmenter.')
 
     args = parser.parse_args()
 
@@ -119,9 +128,10 @@ def main():
 
     # Tokenizer training
     print(
-        f"Parameters: vocab_size={args.vocab_size}, cutoff={args.cutoff}, min_frequency={args.min_frequency}, bf={args.bf}, ooa={args.ooa}")
-    mp = MoP.MorPiece(vocab_size=args.vocab_size, cutoff=args.cutoff, min_frequency=args.min_frequency, bf=args.bf,
-                      ooa=args.ooa, type_based=args.type_based, use_tokenizers_lib=True)
+        f"Parameters: vocab_size={args.vocab_size}, cutoff={args.cutoff}, min_frequency={args.min_frequency}, min_suffix_stems={args.min_suffix_stems}, ooa={args.ooa}, boundaries_discovery={args.boundaries_discovery}")
+    mp = MoP.MorPiece(vocab_size=args.vocab_size, cutoff=args.cutoff, min_frequency=args.min_frequency, min_suffix_stems=args.min_suffix_stems,
+                      ooa=args.ooa, type_based=args.type_based, use_tokenizers_lib=args.use_tokenizers_lib,
+                      boundaries_discovery=args.boundaries_discovery)
 
     mp.train(corpus_file, text_column=args.text_column)
 
