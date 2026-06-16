@@ -1,4 +1,4 @@
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 __author__ = "Cristiano Chesi & NeTS Lab @ IUSS (with Claude Sonnet 4.6 / Opus 4.7 fixes)"
 __email__ = "cristiano.chesi@iusspavia.it"
 __status__ = "Research"
@@ -89,6 +89,7 @@ class MorPiece:
         childes_speaker_tokens=True,
         min_suffix_stems=3,
         ooa_type_interval=1000,
+        boundaries_discovery=False,
     ):
         """
         Parameters
@@ -184,6 +185,17 @@ class MorPiece:
 
         self.roots  = {'[RSX]': {}, '++': {}}
         self.infls  = {}
+        # --- v1.4.5 (--boundaries_discovery) ---------------------------------
+        # When True, MoP does NOT pre-tokenise on whitespace.  The corpus is cut
+        # only at *unambiguous* edges (punctuation + line breaks = true starts
+        # "[[" / true ends "]]"); each anchored sequence traverses the root trie
+        # from its true start and the infl trie from its true end, and boundaries
+        # "||" are placed incrementally as soon as the bilateral TP licenses them
+        # (sufficiency).  Spaces are demoted to an ordinary soft-cue symbol so
+        # word boundaries re-emerge from statistics rather than being given.
+        self.boundaries_discovery = boundaries_discovery
+        self.SPACE_MARK = '\u2581'                 # soft space cue (HF-friendly)
+        self._anchor_re = re.compile(r"[.!?;:,…·。！？；：，、（）()\[\]{}\"'«»\n\r\t]+")
         self.types  = {}
         self.idx    = 0
         self.ids    = []
@@ -674,6 +686,130 @@ class MorPiece:
     # Training
     # =========================================================================
 
+    # =========================================================================
+    # v1.4.5 — boundary discovery (whitespace-free, utterance-anchored)
+    # =========================================================================
+    def _anchor_sequences(self, text: str):
+        """Cut `text` only at UNAMBIGUOUS edges: punctuation + line/tab breaks
+        (each is a true end "]]" of one sequence and a true start "[[" of the
+        next).  Registered special tokens (e.g. CHILDES "*CHI:") are treated as
+        true starts.  Inside a sequence, spaces are kept as the soft-cue symbol
+        SPACE_MARK rather than used as delimiters, so word boundaries must be
+        re-discovered from statistics (this is what makes the method work
+        identically for spaced eng/nld and unspaced zho)."""
+        pieces = []
+        split_re = self._special_token_splitter()
+        chunks = split_re.split(text) if split_re else [text]
+        for chunk in chunks:
+            if chunk in self.roots['[RSX]']:
+                continue                                   # special = anchor only
+            for seg in self._anchor_re.split(chunk):
+                s = ''.join(ch for ch in seg
+                            if ch.isalpha() or ch in (' ', "'", '-'))
+                s = re.sub(r'\s+', ' ', s).strip().replace(' ', self.SPACE_MARK)
+                if len(s) >= 2:
+                    pieces.append(s)
+        return pieces
+
+    def __discover_boundaries(self, seq: str) -> None:
+        """Single left-to-right pass over ONE true-anchored sequence.  At each
+        position the root trie is read from the true start and the infl trie
+        from the true end; a morpheme break "||" is committed as soon as BOTH
+        respect the Tolerance Principle (sufficiency).  Pre-req: `seq` has
+        already been built into self.roots (forward) and self.infls (reversed).
+        Mirrors the bookkeeping of __morsplit so emitted units are retrievable."""
+        n = len(seq)
+        if n < 3:
+            return
+        # v1.4.5a: O(n) instead of O(n^2).  The split test at position i only
+        # needs consecutive node counts on the forward root path (freq(seq[:i-1]),
+        # freq(seq[:i])) and on the backward infl path (freq of the reversed
+        # suffixes of length n-i-1 and n-i).  Both are obtained with ONE linear
+        # walk each, so we never re-slice/re-traverse from the anchors per i.
+        rc = [0] * (n + 1)            # rc[k]   = freq(seq[:k])         (root path)
+        rnode = [None] * (n + 1)      # rnode[k]= node at seq[:k]
+        node = self.roots
+        for k in range(1, n + 1):
+            node = node[seq[k - 1]]
+            rc[k] = node['##']
+            rnode[k] = node
+        ic = [0] * (n + 1)            # ic[j]   = freq(seq[n-j:][::-1]) (infl path)
+        inode = [None] * (n + 1)
+        node = self.infls
+        rev = seq[::-1]
+        for j in range(1, n + 1):
+            node = node[rev[j - 1]]
+            ic[j] = node['##']
+            inode[j] = node
+
+        last = 0
+        for i in range(2, n):         # commit "||" as soon as bilateral TP holds
+            if not self.__check_tp(rc[i - 1], rc[i]):
+                continue
+            if not self.__check_tp(ic[n - i - 1], ic[n - i]):
+                continue
+            morph, suffix = seq[last:i], seq[i:]
+            rn = rnode[i]
+            if 'IDX' not in rn:
+                rn['IDX'] = 1                              # left segment retrievable
+            self.__build_trie(suffix, self.roots['++'])
+            self.suffix_stems.setdefault(suffix, set()).add(morph)
+            if self.ooa:
+                key = self.current_world + " " + morph + "||" + suffix
+                if key in self.ooa_split:
+                    self.ooa_split[key] += 1
+                else:
+                    self.ooa_data.append([
+                        self.current_world, morph + "||" + suffix,
+                        rc[i - 1], rc[i], len(rnode[i]),
+                        ic[n - i - 1], ic[n - i], len(inode[n - i]),
+                        len(self.types), self.num_tokens_in_corpus,
+                    ])
+                    self.ooa_split[key] = 1
+            last = i
+
+    def __train_boundaries_discovery(self, all_contents: str, n_files: int,
+                                     output_dir: str) -> None:
+        """Whitespace-free training pass: anchor -> sort shorter-first -> build
+        the dual trie over full sequences -> place boundaries by sufficiency ->
+        shared post-processing (identical to the tail of train())."""
+        sequences = self._anchor_sequences(all_contents)
+        sequences.sort(key=len)                            # developmental curriculum
+        self.num_tokens_in_corpus = len(sequences)
+        for s in sequences:
+            self.num_chars_in_corpus += len(s)
+        print(f"MorPiece (--boundaries_discovery): {n_files} files -> "
+              f"{len(sequences)} true-anchored sequences "
+              f"(whitespace NOT a boundary; shorter-first).")
+
+        token_counter = 0
+        for seq in sequences:
+            self.current_world = seq
+            self.__build_trie(seq, self.roots)             # root trie  (true start)
+            self.__build_trie(seq[::-1], self.infls)       # infl trie  (true end)
+            self.__discover_boundaries(seq)
+            token_counter += 1
+            if self.ooa and token_counter % 100000 == 0:
+                self.__incremental_cleaning(self.roots, self.min_frequency)
+                self.__build_vocab_freq()
+                ooa_dir = os.path.join(
+                    output_dir, f"ooa_cutoff{self.cutoff}_mfreq{self.min_frequency}")
+                os.makedirs(ooa_dir, exist_ok=True)
+                self.save_vocab(os.path.join(ooa_dir, f"vocab_{token_counter}.json"))
+                print('.', end='', flush=True)
+        if self.ooa:
+            print("")
+
+        # shared post-processing (mirror tail of train())
+        self.types = dict(sorted(self.types.items(), key=lambda x: x[1], reverse=True))
+        self.__sort_trie_by_freq(self.roots)
+        self.num_chars_in_trie = self.__count_trie_nodes(self.roots)
+        self.__prune_weak_suffixes()
+        self.__optimize(self.roots)
+        self.num_chars_in_optimized_trie = self.__count_trie_nodes(self.roots)
+        print(f"MorPiece (--boundaries_discovery) trained: final vocabulary = "
+              f"{self.get_vocab_size()} tokens")
+
     def train(self, training_corpus_path: str, text_column: str = "text",
               save_complete_tries=None, output_dir: str = "tokenizer") -> None:
         """
@@ -729,6 +865,11 @@ class MorPiece:
                     content = self._preprocess_text(content)
                     all_contents += content + "\n"
                     n_files += 1
+
+        # v1.4.5: boundary-discovery mode never tokenises on whitespace.
+        if self.boundaries_discovery:
+            self.__train_boundaries_discovery(all_contents, n_files, output_dir)
+            return
 
         words = all_contents.split()
         print(
