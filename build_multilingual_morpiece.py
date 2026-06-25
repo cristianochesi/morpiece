@@ -9,7 +9,7 @@ fixed token budget per language* (e.g. 16K each for eng / nld / zho), and export
 it so that Chinese (whitespace-free) is tokenized properly rather than collapsing
 to <unk>.
 
-Requires the v1.4.6+ tokenizer_MorPiece.py (encode() ids/tokens alignment fix).
+Requires the v1.4.5+ tokenizer_MorPiece.py (encode() ids/tokens alignment fix).
 
 WHY per-language training instead of one pooled corpus
 ------------------------------------------------------
