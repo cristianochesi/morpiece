@@ -118,6 +118,19 @@ def main():
                              'starts/ends from punctuation+line breaks, sequences sorted '
                              'shorter-first, spaces demoted to a soft cue. Lets MoP run '
                              'uniformly on eng/nld AND zho without a word segmenter.')
+    parser.add_argument('--counter_unit', choices=['tokens', 'chars', 'syllables'],
+                        default='tokens',
+                        help='Unit in which token-based OOA exposure is measured for '
+                             'snapshots/incremental cleaning: tokens (default = previous '
+                             'behaviour), chars, or syllables. Syllables is the most '
+                             'cross-linguistically comparable unit (e.g. EN vs IT); chars '
+                             'is a serviceable proxy. Ignored in type_based mode.')
+    parser.add_argument('--ooa_token_interval', type=int, default=200000,
+                        help='Amount of --counter_unit between OOA snapshots / incremental '
+                             'cleaning passes in token-based mode (default 100000). This is '
+                             'the value that was previously hard-coded to 100000 tokens.')
+    parser.add_argument('--ooa_type_interval', type=int, default=10000,
+                        help='Types between OOA snapshots in type_based mode (default 1000).')
 
     args = parser.parse_args()
 
@@ -128,12 +141,15 @@ def main():
 
     # Tokenizer training
     print(
-        f"Parameters: vocab_size={args.vocab_size}, cutoff={args.cutoff}, min_frequency={args.min_frequency}, min_suffix_stems={args.min_suffix_stems}, ooa={args.ooa}, boundaries_discovery={args.boundaries_discovery}")
+        f"Parameters: vocab_size={args.vocab_size}, cutoff={args.cutoff}, min_frequency={args.min_frequency}, min_suffix_stems={args.min_suffix_stems}, ooa={args.ooa}, boundaries_discovery={args.boundaries_discovery}, counter_unit={args.counter_unit}, ooa_token_interval={args.ooa_token_interval}, ooa_type_interval={args.ooa_type_interval}")
     mp = MoP.MorPiece(vocab_size=args.vocab_size, cutoff=args.cutoff, min_frequency=args.min_frequency, min_suffix_stems=args.min_suffix_stems,
                       ooa=args.ooa, type_based=args.type_based, use_tokenizers_lib=args.use_tokenizers_lib,
-                      boundaries_discovery=args.boundaries_discovery)
+                      boundaries_discovery=args.boundaries_discovery,
+                      ooa_token_interval=args.ooa_token_interval,
+                      ooa_type_interval=args.ooa_type_interval,
+                      counter_unit=args.counter_unit)
 
-    mp.train(corpus_file, text_column=args.text_column)
+    mp.train(corpus_file, text_column=args.text_column, output_dir=output_dir)
 
     # -----------------------------------------------------------------------
     # PRIMARY SAVE: HuggingFace format directly in output_dir/
@@ -152,10 +168,7 @@ def main():
     mp.save_pretrained(os.path.join(native_dir, 'tokenizer.json'))
     mp.save_types(os.path.join(native_dir, 'vocab_types.json'))
     if (args.ooa):
-        ooa_dir = os.path.join(output_dir, 'ooa_bf' + str(args.bf) + '_cutoff' + str(args.cutoff) + '_mfreq' + str(
-            args.min_frequency))
-        os.makedirs(ooa_dir, exist_ok=True)
-        mp.save_ooa(os.path.join(ooa_dir, 'ooa_vocab.tsv'))
+        mp.save_ooa(os.path.join(output_dir, 'ooa_vocab.tsv'))
     # To reload a previously saved tokenizer (native format):
     # mp.from_pretrained(os.path.join(output_dir, 'native'))
     # To reload as PreTrainedTokenizerFast (HF format, for inference):

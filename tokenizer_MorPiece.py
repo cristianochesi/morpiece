@@ -1,8 +1,8 @@
 __version__ = "1.4.5"
-__author__ = "Cristiano Chesi & NeTS Lab @ IUSS (with Claude Sonnet 4.6 / Opus 4.7 fixes)"
+__author__ = "Cristiano Chesi & NeTS Lab @ IUSS (with Claude Sonnet 4.6 / Opus 4.8 fixes)"
 __email__ = "cristiano.chesi@iusspavia.it"
 __status__ = "Research"
-__date__ = "2026-05-23"
+__date__ = "2026-06-20"
 __license__ = "MIT"
 
 """
@@ -22,6 +22,8 @@ MaxLength strategy is adopted to retrieve the tokens for each word.
 Since version 1.4.* a type-based tokenization option is implemented ('type_based = true')
 
 If the "order or acquisition" (ooa) parameter is set to True, each 100K of exposure a vocabulary is created to check splitting hypotheses postulated and the evidence needed (for research purposes)
+
+NOTE: by default (char_coverage=0.99) the most frequent characters are added to the final vocabulary at the end of training, each in both its root ("c") and inflectional ("++c") form, up to 99% of character occurrences. This gives one token per glyph (ideal for CJK — "中文" -> "中" "++文"), works identically in the exported HuggingFace WordPiece tokenizer, and leaves the WordPiece segmentation of known words unchanged. The added tokens are baked into the saved tokenizer, so char_coverage need not be set when loading a trained tokenizer.
 
 Examples:
 
@@ -89,7 +91,10 @@ class MorPiece:
         childes_speaker_tokens=True,
         min_suffix_stems=3,
         ooa_type_interval=1000,
+        ooa_token_interval=100000,
+        counter_unit='tokens',
         boundaries_discovery=False,
+        char_coverage=0.99,
     ):
         """
         Parameters
@@ -137,6 +142,20 @@ class MorPiece:
             Prunes coincidental character overlaps (e.g. "nto" from only "lento").
         ooa_type_interval : int
             Types between OOA snapshots in type_based mode (default 1000).
+        ooa_token_interval : int
+            Amount of `counter_unit` between OOA snapshots / incremental-cleaning
+            passes in TOKEN-based mode (and in --boundaries_discovery).  Default
+            100000.  Previously hard-coded to 100000 tokens.
+        counter_unit : str
+            Unit in which token-based OOA exposure is accumulated:
+            'tokens' (default; one increment per processed token — exactly the
+            previous behaviour), 'chars' (UTF-8 characters), or 'syllables'
+            (approximate vowel-group / per-CJK-glyph count).  The syllable is the
+            most cross-linguistically comparable measure of input quantity
+            (Räsänen et al. 2019, 2021), so for EN-vs-IT parity prefer
+            counter_unit='syllables' over a fixed word-token interval.  Applies
+            to the token-based and boundary-discovery snapshot schedules only;
+            type_based snapshots remain measured in types via ooa_type_interval.
         special_tokens : list or None
             Reserved tokens; defaults to the standard set.
         """
@@ -178,6 +197,13 @@ class MorPiece:
         self.ooa                 = ooa
         self.ooa_split           = {}
         self.ooa_type_interval   = ooa_type_interval
+        if counter_unit not in ('tokens', 'chars', 'syllables'):
+            raise ValueError(
+                f"counter_unit must be 'tokens', 'chars' or 'syllables', "
+                f"got {counter_unit!r}"
+            )
+        self.ooa_token_interval  = ooa_token_interval
+        self.counter_unit        = counter_unit
         self.use_tokenizers_lib  = use_tokenizers_lib
         self.type_based          = type_based
         self.min_suffix_stems    = min_suffix_stems
@@ -195,6 +221,12 @@ class MorPiece:
         # word boundaries re-emerge from statistics rather than being given.
         self.boundaries_discovery = boundaries_discovery
         self.SPACE_MARK = '\u2581'                 # soft space cue (HF-friendly)
+        # v1.4.5: at the end of training, add the most frequent characters as
+        # single-character vocab tokens (root "c" + infl "++c") up to this
+        # fraction of character occurrences.  One token per glyph — far better
+        # than a byte fallback for CJK.  Default 0.99; set 0/None to disable.
+        # See _add_frequent_chars.  Irrelevant at load (the tokens are saved).
+        self.char_coverage = char_coverage
         self._anchor_re = re.compile(r"[.!?;:,…·。！？；：，、（）()\[\]{}\"'«»\n\r\t]+")
         self.types  = {}
         self.idx    = 0
@@ -203,6 +235,7 @@ class MorPiece:
         self.cutoff = cutoff
 
         self.num_tokens_in_corpus        = 0
+        self._ooa_exposure               = 0   # running token position for the OOA event log
         self.num_chars_in_corpus         = 0
         self.num_chars_in_trie           = 0
         self.num_chars_in_optimized_trie = 0
@@ -449,7 +482,7 @@ class MorPiece:
                         self.ooa_data.append([
                             self.current_world, stem + "-" + suffix,
                             r_m, r_d, r_nd, i_m, i_d, i_nd,
-                            len(self.types), self.num_tokens_in_corpus,
+                            len(self.types), self._ooa_exposure,
                         ])
                         self.ooa_split[key] = 1
 
@@ -560,6 +593,83 @@ class MorPiece:
         tp = m / log(m)
         return (m != d) and (d > tp)
 
+    def _add_frequent_chars(self) -> None:
+        """Ensure the most frequent characters are in the vocabulary as single
+        tokens, up to `char_coverage` of character occurrences (default 0.99).
+
+        Rationale (v1.4.5): rather than a byte fallback (which shreds each CJK
+        glyph into 3 UTF-8 byte tokens), we add the actual *characters* — one
+        token per glyph.  For every frequent character we make sure BOTH forms
+        exist:
+          • root form          "c"   (word-initial)
+          • inflectional form  "++c" (word-internal / continuation)
+        so e.g. "中文你好" tokenises as ["中", "++文", "++你", "++好"] — and,
+        because these are ordinary single-character vocab entries, the SAME
+        thing happens in the exported HuggingFace WordPiece tokenizer (no model
+        change, no fragmentation).
+
+        Character frequencies are token-weighted over the (alphabetic) word
+        types, so coverage is measured over real character occurrences.  This
+        runs AFTER __optimize, so it only ADDS vocabulary entries and never
+        changes how already-known words are segmented (a word that contains
+        none of the newly-added characters is untouched; for a word that does,
+        the deeper greedy match still wins, so Latin segmentation — and the
+        SIGMORPHON behaviour — is unchanged).  The added tokens are written into
+        self.roots, so they are saved with the tokenizer and present on reload.
+
+        Controlled by `char_coverage` (default 0.99): set to 0/None to disable.
+        Characters beyond the coverage threshold (the rare <1% tail) are left
+        out and remain "<unk>".
+        """
+        cov = self.char_coverage
+        if not cov or cov <= 0:
+            return
+        if not self.types:
+            # no per-type counts available (e.g. boundaries_discovery) -> nothing to do
+            return
+
+        # token-weighted character frequencies over the alphabetic word types
+        char_freq: dict[str, int] = {}
+        for word, count in self.types.items():
+            for ch in word:
+                char_freq[ch] = char_freq.get(ch, 0) + count
+        total = sum(char_freq.values())
+        if total == 0:
+            return
+
+        target = cov * total
+        ranked = sorted(char_freq.items(), key=lambda kv: kv[1], reverse=True)
+
+        def _ensure_idx(container: dict, key: str) -> bool:
+            """Give `container[key]` an IDX if it lacks one; return True if added."""
+            node = container.get(key)
+            if isinstance(node, dict):
+                if 'IDX' in node:
+                    return False
+                node['IDX'] = self.idx
+            else:
+                container[key] = {'IDX': self.idx}
+            self.idx += 1
+            return True
+
+        added_root = added_infl = n_chars = 0
+        cum = 0
+        for ch, f in ranked:
+            if cum >= target:
+                break
+            cum += f
+            n_chars += 1
+            if ch not in self.vocab_to_id:                 # root form  "c"
+                added_root += _ensure_idx(self.roots, ch)
+            if ('++' + ch) not in self.vocab_to_id:        # infl form  "++c"
+                added_infl += _ensure_idx(self.roots['++'], ch)
+
+        self.__build_vocab_lookup()
+        if added_root or added_infl:
+            print(f"  Added frequent-char coverage to {cov:.0%}: "
+                  f"+{added_root} root, +{added_infl} ++ tokens "
+                  f"(covering {n_chars} distinct chars).")
+
     def __build_vocab_lookup(self) -> None:
         self.vocab_to_id = {}
 
@@ -613,26 +723,54 @@ class MorPiece:
         traverse(self.roots, [])
         return dict(sorted(snapshot.items(), key=lambda x: x[1], reverse=True))
 
+    # def __sort_trie_by_freq(self, d):
+    #    if not isinstance(d, dict):
+    #        return d
+    #    sorted_items = sorted(
+    #        d.items(),
+    #        key=lambda item: item[1].get('##', float('-inf')) if isinstance(item[1], dict) else float('-inf'),
+    #        reverse=True,
+    #    )
+    #    d.clear()
+    #    for k, v in sorted_items:
+    #        d[k] = self.__sort_trie_by_freq(v)
+    #    return d
+        
     def __sort_trie_by_freq(self, d):
         if not isinstance(d, dict):
             return d
-        sorted_items = sorted(
-            d.items(),
-            key=lambda item: item[1].get('##', float('-inf')) if isinstance(item[1], dict) else float('-inf'),
-            reverse=True,
-        )
-        d.clear()
-        for k, v in sorted_items:
-            d[k] = self.__sort_trie_by_freq(v)
+        stack = [d]
+        while stack:
+            node = stack.pop()
+            items = sorted(
+                node.items(),
+                key=lambda item: item[1].get('##', float('-inf')) if isinstance(item[1], dict) else float('-inf'),
+                reverse=True,
+            )
+            keys = list(node.keys())
+            for k in keys:
+                del node[k]
+            for k, v in items:
+                node[k] = v
+                if isinstance(v, dict):
+                    stack.append(v)
         return d
 
     def __count_trie_nodes(self, trie_node) -> int:
+        """Iterative (stack-based) node count. Must NOT be recursive: in
+        --boundaries_discovery mode the trie can have branches as deep as
+        the longest un-anchored sequence in the corpus, which routinely
+        exceeds Python's default recursion limit (RecursionError)."""
         if not isinstance(trie_node, dict):
             return 0
-        count = 1
-        for key, value in trie_node.items():
-            if key not in ('IDX', '##') and isinstance(value, dict):
-                count += self.__count_trie_nodes(value)
+        count = 0
+        stack = [trie_node]
+        while stack:
+            node = stack.pop()
+            count += 1
+            for key, value in node.items():
+                if key not in ('IDX', '##') and isinstance(value, dict):
+                    stack.append(value)
         return count
 
     def prepare_encoding(self) -> None:
@@ -763,7 +901,7 @@ class MorPiece:
                         self.current_world, morph + "||" + suffix,
                         rc[i - 1], rc[i], len(rnode[i]),
                         ic[n - i - 1], ic[n - i], len(inode[n - i]),
-                        len(self.types), self.num_tokens_in_corpus,
+                        len(self.types), self._ooa_exposure,
                     ])
                     self.ooa_split[key] = 1
             last = i
@@ -783,20 +921,25 @@ class MorPiece:
               f"(whitespace NOT a boundary; shorter-first).")
 
         token_counter = 0
+        next_ooa_at = self.ooa_token_interval
+        self._ooa_exposure = 0                 # running sequence position for the OOA event log
         for seq in sequences:
             self.current_world = seq
+            self._ooa_exposure += 1
             self.__build_trie(seq, self.roots)             # root trie  (true start)
             self.__build_trie(seq[::-1], self.infls)       # infl trie  (true end)
             self.__discover_boundaries(seq)
-            token_counter += 1
-            if self.ooa and token_counter % 100000 == 0:
+            token_counter += self._ooa_increment(seq)
+            if self.ooa and token_counter >= next_ooa_at:
                 self.__incremental_cleaning(self.roots, self.min_frequency)
                 self.__build_vocab_freq()
                 ooa_dir = os.path.join(
-                    output_dir, f"ooa_cutoff{self.cutoff}_mfreq{self.min_frequency}")
+                    output_dir, f"ooa_vocab_growth")
                 os.makedirs(ooa_dir, exist_ok=True)
                 self.save_vocab(os.path.join(ooa_dir, f"vocab_{token_counter}.json"))
                 print('.', end='', flush=True)
+                while next_ooa_at <= token_counter:
+                    next_ooa_at += self.ooa_token_interval
         if self.ooa:
             print("")
 
@@ -807,8 +950,59 @@ class MorPiece:
         self.__prune_weak_suffixes()
         self.__optimize(self.roots)
         self.num_chars_in_optimized_trie = self.__count_trie_nodes(self.roots)
+        self._add_frequent_chars()
         print(f"MorPiece (--boundaries_discovery) trained: final vocabulary = "
               f"{self.get_vocab_size()} tokens")
+
+    # =========================================================================
+    # OOA exposure accounting (--counter_unit)
+    # =========================================================================
+    @staticmethod
+    def _count_syllables(text: str) -> int:
+        """Approximate syllable count for OOA exposure accounting.
+
+        Latin script: number of maximal vowel runs (the standard cheap nucleus
+        estimate; slightly under-counts hiatus such as IT 'pa-u-ra').  CJK
+        ideographs, Kana morae and Hangul syllable blocks count 1 each (~one
+        syllable per glyph), keeping the unit meaningful for zho/jpn/kor under
+        --boundaries_discovery.  This is for *setting an interval*, not for
+        linguistic analysis: the syllable is used because it is the most
+        cross-linguistically comparable measure of input quantity
+        (Raesaenen et al. 2019, 2021)."""
+        VOWELS = set("aeiouy\u00e0\u00e1\u00e2\u00e3\u00e4\u00e5\u00e8\u00e9"
+                     "\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u00f2\u00f3\u00f4"
+                     "\u00f5\u00f6\u00f9\u00fa\u00fb\u00fc\u00fd\u00ff")
+        syl, in_vowel, has_letter = 0, False, False
+        for ch in text.lower():
+            cp = ord(ch)
+            if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
+                    0xF900 <= cp <= 0xFAFF or 0x3040 <= cp <= 0x30FF or
+                    0xAC00 <= cp <= 0xD7A3):
+                syl += 1
+                in_vowel = False
+                has_letter = True
+                continue
+            if ch in VOWELS:
+                has_letter = True
+                if not in_vowel:
+                    syl += 1
+                    in_vowel = True
+            else:
+                if ch.isalpha():
+                    has_letter = True
+                in_vowel = False
+        if has_letter and syl == 0:        # consonant-only alphabetic token
+            return 1
+        return syl
+
+    def _ooa_increment(self, text: str) -> int:
+        """How much one processed item advances the token-based OOA exposure
+        counter, per self.counter_unit: 'tokens'->1, 'chars'->len, 'syllables'->~syl."""
+        if self.counter_unit == 'chars':
+            return len(text)
+        if self.counter_unit == 'syllables':
+            return self._count_syllables(text)
+        return 1
 
     def train(self, training_corpus_path: str, text_column: str = "text",
               save_complete_tries=None, output_dir: str = "tokenizer") -> None:
@@ -884,7 +1078,8 @@ class MorPiece:
                     f"{self.ooa_type_interval} types (frequency-ordered) (.):"
                 )
             else:
-                print("Saving Order Of Acquisition Vocabulary every 100000 tokens (.):")
+                print(f"Saving Order Of Acquisition Vocabulary every "
+                      f"{self.ooa_token_interval} {self.counter_unit} (.):")
 
         # --- type-frequency counting pass ------------------------------------
         for word in words:
@@ -926,12 +1121,15 @@ class MorPiece:
 
         # --- main trie-building pass -----------------------------------------
         token_counter = 0
+        next_ooa_at = self.ooa_token_interval
+        self._ooa_exposure = 0                 # running token position for the OOA event log
         for word in training_items:
             # v1.4.4: registered special tokens stay atomic — they already
             # live in [RSX] with their own IDX, so do not morsplit them.
             if word in self.roots['[RSX]']:
                 self.current_world = word
-                token_counter += 1
+                self._ooa_exposure += 1
+                token_counter += 1 if self.type_based else self._ooa_increment(word)
                 continue
             word_alpha = ''.join(
                 ch for ch in word if ch.isalpha() or ch in ("'", "-")
@@ -941,17 +1139,23 @@ class MorPiece:
                 continue
 
             self.current_world = word
+            self._ooa_exposure += 1            # stamp this token's position before morsplit
             self.__build_trie(word[::-1], self.infls)
             self.__build_trie(word, self.roots)
             self.__morsplit(word)
-            token_counter += 1
+            token_counter += 1 if self.type_based else self._ooa_increment(word)
 
             # -----------------------------------------------------------------
             # OOA snapshots
+            #   type_based : every `ooa_type_interval` TYPES (exposure = types).
+            #   token-based: every `ooa_token_interval` units of `counter_unit`
+            #                (tokens | chars | syllables).  Threshold-crossing
+            #                (>=) instead of modulo, so chars/syllables — whose
+            #                per-item increment exceeds 1 — never skip a snapshot.
             # -----------------------------------------------------------------
             if self.ooa:
                 ooa_dir = os.path.join(
-                    output_dir, f"ooa_cutoff{self.cutoff}_mfreq{self.min_frequency}"
+                    output_dir, f"ooa_vocab_growth"
                 )
                 if self.type_based:
                     if token_counter % self.ooa_type_interval == 0:
@@ -961,13 +1165,14 @@ class MorPiece:
                         with open(snap_path, 'w') as f:
                             json.dump({'vocab': snap}, f, indent=2)
                         print('.', end='', flush=True)
-                else:
-                    if token_counter % 100000 == 0:
-                        self.__incremental_cleaning(self.roots, self.min_frequency)
-                        self.__build_vocab_freq()
-                        os.makedirs(ooa_dir, exist_ok=True)
-                        self.save_vocab(os.path.join(ooa_dir, f"vocab_{token_counter}.json"))
-                        print('.', end='', flush=True)
+                elif token_counter >= next_ooa_at:
+                    self.__incremental_cleaning(self.roots, self.min_frequency)
+                    self.__build_vocab_freq()
+                    os.makedirs(ooa_dir, exist_ok=True)
+                    self.save_vocab(os.path.join(ooa_dir, f"vocab_{token_counter}.json"))
+                    print('.', end='', flush=True)
+                    while next_ooa_at <= token_counter:
+                        next_ooa_at += self.ooa_token_interval
 
         if self.ooa:
             print("")
@@ -996,6 +1201,8 @@ class MorPiece:
         self.__optimize(self.roots)
         self.num_chars_in_optimized_trie = self.__count_trie_nodes(self.roots)
 
+        self._add_frequent_chars()
+
         print(f"MorPiece tokenizer trained: final vocabulary = {self.get_vocab_size()} tokens")
         if self.ooa:
             print("MorPiece tokenizer Order of Acquisition data prepared.")
@@ -1016,7 +1223,15 @@ class MorPiece:
                 self.prepare_encoding()
                 self.__retrieve(word, self.roots)
         if self.use_tokenizers_lib:
+            # v1.4.6 fix: _postprocess_tokens prepends BOS to the ID list only.
+            # Mirror that prepend in the token list so the two returned lists
+            # stay index-aligned — callers (calculate_stats, diagnose_tp, the
+            # multilingual router, anything that zips ids with tokens) relied on
+            # len(ids) == len(tokens), which silently broke after the BOS prepend.
+            n_before = len(self.ids)
             self.ids = self._postprocess_tokens(self.ids)
+            if len(self.ids) == n_before + 1:
+                self.tokens = [self.start_of_text_symbol] + self.tokens
         return self.ids, self.tokens
 
     def decode(self, sentence_idxs: list) -> list:
