@@ -34,6 +34,15 @@ Todo:
 
 
 RELEASE NOTES:
+Changes in 1.4.5
+----------------
+`--boundaries_discovery` and `--char_coverage` option agged.
+ When True, `--boundaries_discovery` forces MoP to NOT pre-tokenise on whitespace.  
+The corpus is segmented only at unambiguous boundaries (punctuation + line breaks = true starts `[[` / true ends `]]`), and each sequence is ordered by length (shorter first; ~curriculum learning). Each anchored sequence traverses the root trie from its true start and the infl trie from its true end. Boundaries (`||`) are then inserted incrementally as soon as they are licensed by the bilateral TP according to the sufficiency principle (Yang 2016).
+Spaces are demoted to ordinary soft-cue symbols so that word boundaries re-emerge from statistical evidence rather than being predefined.
+
+`--char_coverage` allows the user to specify the corpus character coverage. Setting it to `0.99` includes all characters not yet present in either the root trie or the infl trie until 99% of the corpus is represented, dramatically reducing `<unk>` occurrences. For example, previously `:smiley:ing` might have been tokenized as `<unk>`; now there is a much greater chance to get `:smiley: ++ing`.
+
 Changes in 1.4.4
 ----------------
 • FIX – bogus root words beginning with an apostrophe ("'abbadessa"):
